@@ -727,6 +727,147 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+
+function parseJsonLoose(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch {}
+  const starts = [raw.indexOf("{"), raw.indexOf("[")].filter((n) => n >= 0);
+  if (!starts.length) return null;
+  const start = Math.min(...starts);
+  for (let end = raw.length; end > start; end--) {
+    const ch = raw[end - 1];
+    if (ch !== "}" && ch !== "]") continue;
+    try { return JSON.parse(raw.slice(start, end)); } catch {}
+  }
+  return null;
+}
+
+async function ensureBerylInboxAutomations() {
+  const timezone = "Europe/London";
+  const whatsappTarget = "120363430543236627@g.us";
+  const persistentSession = "session:beryl-inbox-monitor";
+
+  const jobs = [
+    {
+      name: "Beryl Inbox - Morning 07:00",
+      cron: "0 7 * * *",
+      prompt: [
+        "Create Hanna and Cat's full 7am inbox briefing.",
+        "Review both Microsoft 365 inboxes comprehensively: all new mail since the previous evening check, plus any still-relevant unresolved items from the previous business day.",
+        "State exactly how many emails you reviewed for Hanna and how many for Cat.",
+        "For each person use these sections: Urgent/action today; Reply/decision needed; Worth knowing/no action yet.",
+        "For items in the first two sections add one short recommended next action.",
+        "Include genuine business-relevant mail even if it is not urgent. Only omit obvious newsletters, generic promotions, receipts, automated confirmations, and junk.",
+        "Do not repeat the same underlying item twice just because both Hanna and Cat were copied; note cross-inbox duplicates clearly.",
+        "Keep it concise enough for WhatsApp but complete enough to run the day from."
+      ].join(" "),
+    },
+    {
+      name: "Beryl Inbox - Daytime Updates",
+      cron: "0 8-17 * * *",
+      prompt: [
+        "Run the hourly daytime inbox check for Hanna and Cat.",
+        "Review new Microsoft 365 emails received since the previous successful inbox check (for the 8am run, since the 7am briefing).",
+        "Compare against what you have already surfaced in this persistent inbox-monitor session.",
+        "Only report genuinely new business-relevant information: urgent/action today, reply/decision needed, or useful worth-knowing updates.",
+        "Never repeat an item already reported unless there is a material new reply, deadline, status change, or escalation.",
+        "For each new item give the person (Hanna or Cat), what changed, and one recommended next action where appropriate.",
+        "State how many new emails you reviewed for Hanna and Cat.",
+        "If there is nothing new worth telling Hanna, output exactly NO_REPLY and nothing else.",
+        "Omit newsletters, generic promotions, receipts, automated confirmations, and junk."
+      ].join(" "),
+    },
+    {
+      name: "Beryl Inbox - End of Day 18:00",
+      cron: "0 18 * * *",
+      prompt: [
+        "Create Hanna and Cat's 6pm end-of-day inbox wrap.",
+        "Review new mail since the previous daytime check and use this persistent inbox-monitor session to avoid repeating items unnecessarily.",
+        "Summarise: New since last update; Still awaiting action/reply; Safe to leave until tomorrow.",
+        "Carry forward only genuinely unresolved items from today that still need Hanna or Cat's attention.",
+        "For unresolved action items add one short recommended next action.",
+        "State how many new emails you reviewed for Hanna and Cat.",
+        "Omit newsletters, generic promotions, receipts, automated confirmations, and junk.",
+        "Always send this end-of-day wrap, even if it is brief."
+      ].join(" "),
+    },
+  ];
+
+  const list = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["automations", "list", "--all", "--agent", "beryl", "--json"]),
+    { timeoutMs: 60_000 },
+  );
+  if (list.code !== 0) {
+    throw new Error("Could not list Beryl automations: " + list.output.slice(-1200));
+  }
+
+  const parsed = parseJsonLoose(list.output);
+  const existingJobs = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.jobs)
+      ? parsed.jobs
+      : Array.isArray(parsed?.items)
+        ? parsed.items
+        : [];
+
+  for (const spec of jobs) {
+    const matches = existingJobs.filter((j) =>
+      String(j?.name ?? "").trim().toLowerCase() === spec.name.toLowerCase()
+    );
+
+    const common = [
+      "--cron", spec.cron,
+      "--tz", timezone,
+      "--exact",
+      "--agent", "beryl",
+      "--session", persistentSession,
+      "--message", spec.prompt,
+      "--timeout-seconds", "240",
+      "--announce",
+      "--channel", "whatsapp",
+      "--account", "beryl",
+      "--to", whatsappTarget,
+    ];
+
+    if (matches.length > 0) {
+      const id = String(matches[0].id ?? matches[0].jobId ?? "");
+      if (!id) throw new Error("Existing automation missing id: " + spec.name);
+      const edited = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["automations", "edit", id, ...common, "--json"]),
+        { timeoutMs: 60_000 },
+      );
+      if (edited.code !== 0) {
+        throw new Error("Could not edit " + spec.name + ": " + edited.output.slice(-1200));
+      }
+      const enabled = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["automations", "enable", id, "--json"]),
+        { timeoutMs: 60_000 },
+      );
+      if (enabled.code !== 0) {
+        throw new Error("Could not enable " + spec.name + ": " + enabled.output.slice(-1200));
+      }
+      if (matches.length > 1) {
+        console.warn("[beryl-automation] duplicate jobs found for " + spec.name + "; updated first match only");
+      }
+      console.log("[beryl-automation] ensured existing job: " + spec.name);
+    } else {
+      const created = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["automations", "create", ...common, "--name", spec.name, "--json"]),
+        { timeoutMs: 60_000 },
+      );
+      if (created.code !== 0) {
+        throw new Error("Could not create " + spec.name + ": " + created.output.slice(-1200));
+      }
+      console.log("[beryl-automation] created job: " + spec.name);
+    }
+  }
+}
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     const respondJson = (status, body) => {
@@ -1477,6 +1618,12 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     try {
       await ensureGatewayRunning();
       console.log("[wrapper] gateway ready");
+      try {
+        await ensureBerylInboxAutomations();
+        console.log("[wrapper] Beryl inbox automations ready");
+      } catch (err) {
+        console.warn("[wrapper] Beryl inbox automation setup failed (continuing): " + String(err));
+      }
     } catch (err) {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
