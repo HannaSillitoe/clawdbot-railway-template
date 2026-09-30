@@ -1556,6 +1556,31 @@ app.use(requireDashboardAuth, async (req, res) => {
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
+
+let gatewayStartupRetryTimer = null;
+
+function scheduleGatewayStartupRetry() {
+  if (gatewayStartupRetryTimer) return;
+  const attempt = async () => {
+    gatewayStartupRetryTimer = null;
+    if (gatewayProc) return;
+    try {
+      await ensureGatewayRunning();
+      console.log("[wrapper] gateway ready after retry");
+      try {
+        await ensureBerylInboxAutomations();
+        console.log("[wrapper] Beryl inbox automations ready");
+      } catch (err) {
+        console.warn("[wrapper] Beryl inbox automation setup failed after retry (continuing): " + String(err));
+      }
+    } catch (err) {
+      console.warn("[wrapper] gateway retry not ready yet: " + String(err));
+      gatewayStartupRetryTimer = setTimeout(attempt, 30_000);
+    }
+  };
+  gatewayStartupRetryTimer = setTimeout(attempt, 30_000);
+}
+
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
@@ -1626,6 +1651,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       }
     } catch (err) {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
+      scheduleGatewayStartupRetry();
     }
   }
 });
@@ -1650,19 +1676,36 @@ server.on("upgrade", async (req, socket, head) => {
 });
 
 process.on("SIGTERM", () => {
-  // Best-effort shutdown
   try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
+    if (gatewayStartupRetryTimer) clearTimeout(gatewayStartupRetryTimer);
+  } catch {}
 
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
     process.exit(0);
-  }
+  };
 
-  setTimeout(() => process.exit(0), 5_000).unref?.();
+  try {
+    server.close(() => {
+      if (!gatewayProc) finish();
+    });
+  } catch {}
+
+  try {
+    if (gatewayProc) {
+      console.log("[wrapper] waiting briefly for gateway shutdown");
+      gatewayProc.once("exit", finish);
+      gatewayProc.kill("SIGTERM");
+      setTimeout(() => {
+        try { gatewayProc?.kill("SIGKILL"); } catch {}
+        finish();
+      }, 8_000).unref?.();
+    } else {
+      finish();
+    }
+  } catch {
+    finish();
+  }
 });
