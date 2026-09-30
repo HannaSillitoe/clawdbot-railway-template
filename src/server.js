@@ -171,8 +171,32 @@ async function waitForGatewayReady(opts = {}) {
   return false;
 }
 
+async function reclaimExpiredGatewayOwnerLease() {
+  try {
+    const sqlite = await import("node:sqlite");
+    const candidates = [
+      path.join(STATE_DIR, "openclaw-state.sqlite"),
+      path.join(STATE_DIR, "state.sqlite"),
+    ];
+    const dbPath = candidates.find((p) => fs.existsSync(p));
+    if (!dbPath) return;
+
+    const db = new sqlite.DatabaseSync(dbPath);
+    try {
+      db.prepare(
+        "DELETE FROM state_leases WHERE scope = ? AND lease_key = ? AND expires_at <= ?"
+      ).run("gateway-owner", "global", Date.now());
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.warn("[gateway] stale lease cleanup skipped:", String(err));
+  }
+}
+
 async function startGateway() {
   if (gatewayProc) return;
+  await reclaimExpiredGatewayOwnerLease();
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
